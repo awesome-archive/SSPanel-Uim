@@ -1,419 +1,338 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Models;
 
-/**
- * User Model
- */
-
+use App\Services\IM;
+use App\Services\IM\Telegram;
 use App\Utils\Tools;
-use App\Utils\Hash;
-use App\Services\Config;
-use App\Utils\GA;
-use App\Utils\QQWry;
-use App\Utils\Radius;
-use Ramsey\Uuid\Uuid;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Database\Query\Builder;
+use Telegram\Bot\Exceptions\TelegramSDKException;
+use function date;
+use function hash;
+use function round;
+use const PHP_EOL;
 
-class User extends Model
+/**
+ * @property int    $id 用户ID
+ * @property string $user_name 用户名
+ * @property string $email E-Mail
+ * @property string $pass 登录密码
+ * @property string $passwd 节点密码
+ * @property string $uuid UUID
+ * @property int    $u 账户当前上传流量
+ * @property int    $d 账户当前下载流量
+ * @property int    $transfer_today 账户今日所用流量
+ * @property int    $transfer_total 账户累计使用流量
+ * @property int    $transfer_enable 账户当前可用流量
+ * @property int    $port 端口
+ * @property string $last_detect_ban_time 最后一次被封禁的时间
+ * @property int    $all_detect_number 累计违规次数
+ * @property int    $last_use_time 最后使用时间
+ * @property int    $last_check_in_time 最后签到时间
+ * @property int    $last_login_time 最后登录时间
+ * @property string $reg_date 注册时间
+ * @property float  $money 账户余额
+ * @property int    $ref_by 邀请人ID
+ * @property string $method Shadowsocks加密方式
+ * @property string $reg_ip 注册IP
+ * @property int    $node_speedlimit 用户限速
+ * @property int    $node_iplimit 同时可连接IP数
+ * @property int    $is_admin 是否管理员
+ * @property int    $im_type 联系方式类型
+ * @property string $im_value 联系方式
+ * @property int    $contact_method 偏好的联系方式
+ * @property int    $daily_mail_enable 每日报告开关
+ * @property int    $class 等级
+ * @property string $class_expire 等级过期时间
+ * @property string $theme 网站主题
+ * @property string $ga_token GA密钥
+ * @property int    $ga_enable GA开关
+ * @property string $remark 备注
+ * @property int    $node_group 节点分组
+ * @property int    $is_banned 是否封禁
+ * @property string $banned_reason 封禁理由
+ * @property int    $is_shadow_banned 是否处于账户异常状态
+ * @property int    $expire_notified 过期提醒
+ * @property int    $traffic_notified 流量提醒
+ * @property int    $auto_reset_day 自动重置流量日
+ * @property float  $auto_reset_bandwidth 自动重置流量
+ * @property string $api_token API 密钥
+ * @property int    $is_dark_mode 是否启用暗黑模式
+ * @property int    $is_inactive 是否处于闲置状态
+ * @property string $locale 显示语言
+ *
+ * @mixin Builder
+ */
+final class User extends Model
 {
+    /**
+     * 已登录
+     *
+     * @var bool
+     */
+    public bool $isLogin;
+
     protected $connection = 'default';
     protected $table = 'user';
 
-    public $isLogin;
-
-    public $isAdmin;
-
+    /**
+     * 强制类型转换
+     *
+     * @var array
+     */
     protected $casts = [
-        't' => 'float',
-        'u' => 'float',
-        'd' => 'float',
+        'money' => 'float',
         'port' => 'int',
-        'transfer_enable' => 'float',
-        'enable' => 'int',
-        'is_admin' => 'boolean',
-        'is_multi_user' => 'int',
-        'node_speedlimit' => 'float',
+        'daily_mail_enable' => 'int',
+        'ref_by' => 'int',
     ];
 
-    public function getGravatarAttribute()
+    /**
+     * DiceBear 头像
+     */
+    public function getDiceBearAttribute(): string
     {
-        $hash = md5(strtolower(trim($this->attributes['email'])));
-        return 'https://gravatar.loli.net/avatar/' . $hash."?&d=identicon";
+        return 'https://api.dicebear.com/8.x/identicon/svg?seed=' . hash('sha3-256', $this->email);
     }
 
-    public function isAdmin()
+    /**
+     * User identifier
+     */
+    public function getIdentifierAttribute(): string
     {
-        return $this->attributes['is_admin'];
+        return hash('sha3-256', $this->id . ':' . $this->email);
     }
 
-    public function lastSsTime()
+    /**
+     * 联系方式类型
+     */
+    public function imType(): string
     {
-        if ($this->attributes['t'] == 0) {
-            return '从未使用喵';
-        }
-        return Tools::toDateTime($this->attributes['t']);
+        return match ($this->im_type) {
+            1 => 'Slack',
+            2 => 'Discord',
+            default => 'Telegram',
+        };
     }
 
-    public function getMuMd5()
+    /**
+     * 最后使用时间
+     */
+    public function lastUseTime(): string
     {
-        $str = str_replace(
-            array('%id', '%suffix'),
-            array($this->attributes['id'], Config::get('mu_suffix')),
-            Config::get('mu_regex')
-        );
-        preg_match_all("|%-?[1-9]\d*m|U", $str, $matches, PREG_PATTERN_ORDER);
-        foreach ($matches[0] as $key) {
-            $key_match = str_replace(array('%', 'm'), '', $key);
-            $md5 = substr(
-                MD5($this->attributes['id'] . $this->attributes['passwd'] . $this->attributes['method'] . $this->attributes['obfs'] . $this->attributes['protocol']),
-                ($key_match < 0 ? $key_match : 0),
-                abs($key_match)
-            );
-            $str = str_replace($key, $md5, $str);
-        }
-        return $str;
+        return $this->last_use_time === 0 ? '从未使用' : Tools::toDateTime($this->last_use_time);
     }
 
-    public function lastCheckInTime()
+    /**
+     * 最后签到时间
+     */
+    public function lastCheckInTime(): string
     {
-        if ($this->attributes['last_check_in_time'] == 0) {
-            return '从未签到';
-        }
-        return Tools::toDateTime($this->attributes['last_check_in_time']);
-    }
-
-    public function regDate()
-    {
-        return $this->attributes['reg_date'];
-    }
-
-    public function updatePassword($pwd)
-    {
-        $this->pass = Hash::passwordHash($pwd);
-        $this->save();
-    }
-
-    public function get_forbidden_ip()
-    {
-        return str_replace(',', PHP_EOL, $this->attributes['forbidden_ip']);
-    }
-
-    public function get_forbidden_port()
-    {
-        return str_replace(',', PHP_EOL, $this->attributes['forbidden_port']);
-    }
-
-    public function updateSsPwd($pwd)
-    {
-        $this->passwd = $pwd;
-        $this->save();
-    }
-
-    public function updateMethod($method)
-    {
-        $this->method = $method;
-        $this->save();
-    }
-
-    public function addInviteCode()
-    {
-        $uid = $this->attributes['id'];
-        $code = new InviteCode();
-        while (true) {
-            $temp_code = Tools::genRandomChar(4);
-            if (InviteCode::where('user_id', $uid)->count() == 0) {
-                break;
-            }
-        }
-        $code->code = $temp_code;
-        $code->user_id = $uid;
-        $code->save();
-    }
-
-    public function getUuid()
-    {
-        return Uuid::uuid3(
-            Uuid::NAMESPACE_DNS,
-            $this->attributes['id'] . '|' . $this->attributes['passwd']
-        )->toString();
-    }
-
-    public function trafficUsagePercent()
-    {
-        $total = $this->attributes['u'] + $this->attributes['d'];
-        $transferEnable = $this->attributes['transfer_enable'];
-        if ($transferEnable == 0) {
-            return 0;
-        }
-        $percent = $total / $transferEnable;
-        $percent = round($percent, 2);
-        $percent *= 100;
-        return $percent;
-    }
-
-    public function enableTraffic()
-    {
-        $transfer_enable = $this->attributes['transfer_enable'];
-        return Tools::flowAutoShow($transfer_enable);
-    }
-
-    public function enableTrafficInGB()
-    {
-        $transfer_enable = $this->attributes['transfer_enable'];
-        return Tools::flowToGB($transfer_enable);
-    }
-
-    public function usedTraffic()
-    {
-        $total = $this->attributes['u'] + $this->attributes['d'];
-        return Tools::flowAutoShow($total);
-    }
-
-    public function unusedTraffic()
-    {
-        $total = $this->attributes['u'] + $this->attributes['d'];
-        $transfer_enable = $this->attributes['transfer_enable'];
-        return Tools::flowAutoShow($transfer_enable - $total);
-    }
-
-    public function TodayusedTraffic()
-    {
-        $total = $this->attributes['u'] + $this->attributes['d'] - $this->attributes['last_day_t'];
-        return Tools::flowAutoShow($total);
-    }
-
-    public function LastusedTraffic()
-    {
-        $total = $this->attributes['last_day_t'];
-        return Tools::flowAutoShow($total);
-    }
-
-    public function isAbleToCheckin()
-    {
-        $last = $this->attributes['last_check_in_time'];
-
-        $now = time();
-        return date('Ymd', $now) != date('Ymd', $last);
+        return $this->last_check_in_time === 0 ? '从未签到' : Tools::toDateTime($this->last_check_in_time);
     }
 
     /*
-     * @param traffic 单位 MB
+     * 总流量[自动单位]
      */
-    public function addTraffic($traffic)
+    public function enableTraffic(): string
     {
+        return Tools::autoBytes($this->transfer_enable);
     }
 
-    public function getGAurl()
+    /*
+     * 当期用量[自动单位]
+     */
+    public function usedTraffic(): string
     {
-        $ga = new GA();
-        $url = $ga->getUrl(
-            urlencode(Config::get('appName') . '-' . $this->attributes['user_name'] . '-两步验证码'),
-            $this->attributes['ga_token']
-        );
-        return $url;
+        return Tools::autoBytes($this->u + $this->d);
     }
 
-    public function inviteCodes()
+    /*
+     * 累计用量[自动单位]
+     */
+    public function totalTraffic(): string
     {
-        $uid = $this->attributes['id'];
-        return InviteCode::where('user_id', $uid)->get();
+        return Tools::autoBytes($this->transfer_total);
     }
 
-    public function ref_by_user()
+    /*
+     * 剩余流量[自动单位]
+     */
+    public function unusedTraffic(): string
     {
-        $uid = $this->attributes['ref_by'];
-        return self::where('id', $uid)->first();
+        return Tools::autoBytes($this->transfer_enable - ($this->u + $this->d));
     }
 
-    public function clean_link()
+    /*
+     * 剩余流量占总流量的百分比
+     */
+    public function unusedTrafficPercent(): float
     {
-        $uid = $this->attributes['id'];
-        Link::where('userid', $uid)->delete();
+        return $this->transfer_enable === 0 ?
+            0
+            :
+            round(($this->transfer_enable - ($this->u + $this->d)) / $this->transfer_enable, 2) * 100;
     }
 
-    public function clear_inviteCodes()
+    /*
+     * 今天使用的流量[自动单位]
+     */
+    public function todayUsedTraffic(): string
     {
-        $uid = $this->attributes['id'];
-        InviteCode::where('user_id', $uid)->delete();
+        return Tools::autoBytes($this->transfer_today);
     }
 
-    public function online_ip_count()
+    /*
+     * 今天使用的流量占总流量的百分比
+     */
+    public function todayUsedTrafficPercent(): float
     {
-        $uid = $this->attributes['id'];
-        $total = Ip::where('datetime', '>=', time() - 90)->where('userid', $uid)->orderBy('userid', 'desc')->get();
-        $unique_ip_list = array();
-        foreach ($total as $single_record) {
-            $single_record->ip = Tools::getRealIp($single_record->ip);
-            $is_node = Node::where('node_ip', $single_record->ip)->first();
-            if ($is_node) {
-                continue;
+        return $this->transfer_enable === 0 ?
+            0
+            :
+            round($this->transfer_today / $this->transfer_enable, 2) * 100;
+    }
+
+    /*
+     * 今天之前已使用的流量[自动单位]
+     */
+    public function lastUsedTraffic(): string
+    {
+        return Tools::autoBytes($this->u + $this->d - $this->transfer_today);
+    }
+
+    /*
+     * 今天之前已使用的流量占总流量的百分比
+     */
+    public function lastUsedTrafficPercent(): float
+    {
+        return $this->transfer_enable === 0 ?
+            0
+            :
+            round(($this->u + $this->d - $this->transfer_today) / $this->transfer_enable, 2) * 100;
+    }
+
+    /*
+     * 是否可以签到
+     */
+    public function isAbleToCheckin(): bool
+    {
+        return date('Ymd') !== date('Ymd', $this->last_check_in_time) && ! $this->is_shadow_banned;
+    }
+
+    /**
+     * 删除用户的订阅链接
+     */
+    public function removeLink(): void
+    {
+        (new Link())->where('userid', $this->id)->delete();
+    }
+
+    /**
+     * 删除用户的邀请码
+     */
+    public function removeInvite(): void
+    {
+        (new InviteCode())->where('user_id', $this->id)->delete();
+    }
+
+    /**
+     * 销户
+     */
+    public function kill(): bool
+    {
+        $uid = $this->id;
+
+        (new DetectBanLog())->where('user_id', $uid)->delete();
+        (new DetectLog())->where('user_id', $uid)->delete();
+        (new InviteCode())->where('user_id', $uid)->delete();
+        (new OnlineLog())->where('user_id', $uid)->delete();
+        (new Link())->where('userid', $uid)->delete();
+        (new LoginIp())->where('userid', $uid)->delete();
+        (new SubscribeLog())->where('user_id', $uid)->delete();
+        (new MFADevice())->where('userid', $uid)->delete();
+
+        return $this->delete();
+    }
+
+    public function unbindIM(): bool
+    {
+        $this->im_type = 0;
+        $this->im_value = '';
+
+        if ($this->im_type === 4 && Config::obtain('telegram_unbind_kick_member')) {
+            try {
+                (new Telegram())->banGroupMember((int) $this->im_value);
+            } catch (TelegramSDKException) {
+                return false;
             }
+        }
 
-            if (!in_array($single_record->ip, $unique_ip_list)) {
-                $unique_ip_list[] = $single_record->ip;
+        return $this->save();
+    }
+
+    /**
+     * 发送每日流量报告
+     *
+     * @param string $ann 公告
+     */
+    public function sendDailyNotification(string $ann = ''): void
+    {
+        $lastday_traffic = $this->todayUsedTraffic();
+        $enable_traffic = $this->enableTraffic();
+        $used_traffic = $this->usedTraffic();
+        $unused_traffic = $this->unusedTraffic();
+
+        if ($this->daily_mail_enable === 1) {
+            echo 'Sending daily mail to user: ' . $this->id . PHP_EOL;
+
+            (new EmailQueue())->add(
+                $this->email,
+                $_ENV['appName'] . '-每日流量报告以及公告',
+                'traffic_report.tpl',
+                [
+                    'user' => $this,
+                    'text' => '站点公告:<br><br>' . $ann . '<br><br>晚安！',
+                    'lastday_traffic' => $lastday_traffic,
+                    'enable_traffic' => $enable_traffic,
+                    'used_traffic' => $used_traffic,
+                    'unused_traffic' => $unused_traffic,
+                ]
+            );
+        } elseif ($this->daily_mail_enable === 2 && $this->im_value !== '') {
+            echo 'Sending daily IM message to user: ' . $this->id . PHP_EOL;
+
+            $text = date('Y-m-d') . ' 流量使用报告' . PHP_EOL . PHP_EOL;
+            $text .= '流量总计：' . $enable_traffic . PHP_EOL;
+            $text .= '已用流量：' . $used_traffic . PHP_EOL;
+            $text .= '剩余流量：' . $unused_traffic . PHP_EOL;
+            $text .= '今日使用：' . $lastday_traffic;
+
+            try {
+                IM::send((int) $this->im_value, $text, $this->im_type);
+            } catch (GuzzleException|TelegramSDKException $e) {
+                echo $e->getMessage() . PHP_EOL;
             }
         }
-
-        return count($unique_ip_list);
     }
 
-    public function kill_user()
+    /**
+     * 检查多因素认证启用状态
+     *
+     * @return array
+     */
+    public function checkMfaStatus(): array
     {
-        $uid = $this->attributes['id'];
-        $email = $this->attributes['email'];
-
-        Radius::Delete($email);
-
-        RadiusBan::where('userid', '=', $uid)->delete();
-        Disconnect::where('userid', '=', $uid)->delete();
-        Bought::where('userid', '=', $uid)->delete();
-        Bought::where('userid', '=', $uid)->delete();
-        Ip::where('userid', '=', $uid)->delete();
-        Code::where('userid', '=', $uid)->delete();
-        DetectLog::where('user_id', '=', $uid)->delete();
-        Link::where('userid', '=', $uid)->delete();
-        LoginIp::where('userid', '=', $uid)->delete();
-        InviteCode::where('user_id', '=', $uid)->delete();
-        TelegramSession::where('user_id', '=', $uid)->delete();
-        UnblockIp::where('userid', '=', $uid)->delete();
-        TrafficLog::where('user_id', '=', $uid)->delete();
-        Token::where('user_id', '=', $uid)->delete();
-        PasswordReset::where('email', '=', $email)->delete();
-
-        $this->delete();
-
-        return true;
-    }
-
-    public function get_table_json_array()
-    {
-        $id = $this->attributes['id'];
-        $today_traffic = Tools::flowToMB($this->attributes['u'] + $this->attributes['d'] - $this->attributes['last_day_t']);
-        $is_enable = $this->attributes['enable'] == 1 ? '可用' : '禁用';
-        $reg_location = $this->attributes['reg_ip'];
-        $account_expire_in = $this->attributes['expire_in'];
-        $class_expire_in = $this->attributes['class_expire'];
-        $used_traffic = Tools::flowToGB($this->attributes['u'] + $this->attributes['d']);
-        $enable_traffic = Tools::flowToGB($this->attributes['transfer_enable']);
-
-        $im_type = '';
-        $im_value = $this->attributes['im_value'];
-        switch ($this->attributes['im_type']) {
-            case 1:
-                $im_type = '微信';
-                break;
-            case 2:
-                $im_type = 'QQ';
-                break;
-            case 3:
-                $im_type = 'Google+';
-                break;
-            default:
-                $im_type = 'Telegram';
-                $im_value = '<a href="https://telegram.me/' . $im_value . '">' . $im_value . '</a>';
+        $fido = (new MFADevice())->where('userid', $this->id)->where('type', 'fido')->first();
+        $totp = (new MFADevice())->where('userid', $this->id)->where('type', 'totp')->first();
+        $hasFido = $fido !== null;
+        $hasTotp = $totp !== null;
+        if (! $hasFido && ! $hasTotp) {
+            return ['require' => false];
         }
-
-        $ref_user = self::find($this->attributes['ref_by']);
-
-        if ($this->attributes['ref_by'] == 0) {
-            $ref_user_id = 0;
-            $ref_user_name = '系统邀请';
-        } elseif ($ref_user == null) {
-            $ref_user_id = $this->attributes['ref_by'];
-            $ref_user_name = '邀请人已经被删除';
-        } else {
-            $ref_user_id = $this->attributes['ref_by'];
-            $ref_user_name = $ref_user->user_name;
-        }
-
-        $iplocation = new QQWry();
-        $location = $iplocation->getlocation($reg_location);
-        $reg_location .= "\n" . iconv('gbk', 'utf-8//IGNORE', $location['country'] . $location['area']);
-
-        $return_array = array(
-            'DT_RowId' => 'row_1_' . $id,
-            $id,
-            $id,
-            $this->attributes['user_name'],
-            $this->attributes['remark'],
-            $this->attributes['email'],
-            $this->attributes['money'],
-            $im_type,
-            $im_value,
-            $this->attributes['node_group'],
-            $account_expire_in,
-            $this->attributes['class'],
-            $class_expire_in,
-            $this->attributes['passwd'],
-            $this->attributes['port'],
-            $this->attributes['method'],
-            $this->attributes['protocol'],
-            $this->attributes['obfs'],
-            $this->attributes['obfs_param'],
-            $this->online_ip_count(),
-            $this->lastSsTime(),
-            $used_traffic,
-            $enable_traffic,
-            $this->lastCheckInTime(),
-            $today_traffic,
-            $is_enable,
-            $this->attributes['reg_date'],
-            $reg_location,
-            $this->attributes['auto_reset_day'],
-            $this->attributes['auto_reset_bandwidth'],
-            $ref_user_id,
-            $ref_user_name
-        );
-        return $return_array;
-    }
-
-    public function get_user_attributes($key)
-    {
-        return $this->attributes[$key];
-    }
-
-    public function get_top_up()
-    {
-        $codes = Code::where('userid', $this->attributes['id'])->get();
-        $top_up = 0;
-        foreach ($codes as $code) {
-            $top_up += $code->number;
-        }
-        return round($top_up, 2);
-    }
-
-    public function calIncome($req)
-    {
-    	switch($req)
-    	{
-    		case "yesterday":
-    			$number = Code::whereDate('usedatetime', '=', date('Y-m-d',strtotime('-1 days')))->sum('number');
-    			break;
-    		case "today":
-    			$number = Code::whereDate('usedatetime', '=', date('Y-m-d'))->sum('number');
-    			break;
-    		case "this month":
-    			$number = Code::whereMonth('usedatetime', '=', date('m'))->sum('number');
-    			break;
-    		case "last month":
-    			$number = Code::whereMonth('usedatetime', '=', date('m',strtotime('last month')))->sum('number');
-    			break;
-    		default:
-    			$number = Code::sum('number');
-    			break;
-    	}
-    	return is_null($number)?0:$number;
-    }
-    
-    public function paidUserCount()
-    {
-        return self::where('class', '!=', '0')->count();
-    }
-
-    public function disableReason()
-    {
-        $reason_id = DetectLog::where('user_id', '=', $this->attributes['id'])->orderBy('id', 'DESC')->first();
-        $reason = DetectRule::where('id', '=', $reason_id->list_id)->get();
-        return $reason[0]->text;
+        return ['require' => true, 'fido' => $hasFido, 'totp' => $hasTotp];
     }
 }

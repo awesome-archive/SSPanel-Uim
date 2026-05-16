@@ -1,561 +1,373 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Utils;
 
+use App\Models\Config;
 use App\Models\User;
-use App\Models\Node;
-use App\Models\Relay;
-use App\Services\Config;
-use DateTime;
+use App\Services\GeoIP2;
+use GeoIp2\Exception\AddressNotFoundException;
+use MaxMind\Db\Reader\InvalidDatabaseException;
+use Random\RandomException;
+use function array_diff;
+use function array_flip;
+use function base64_encode;
+use function bin2hex;
+use function ceil;
+use function closedir;
+use function count;
+use function date;
+use function filter_var;
+use function floor;
+use function hash;
+use function in_array;
+use function is_numeric;
+use function json_decode;
+use function log;
+use function max;
+use function mb_strcut;
+use function opendir;
+use function pow;
+use function random_bytes;
+use function range;
+use function readdir;
+use function round;
+use function shuffle;
+use function strlen;
+use function strpos;
+use function substr;
+use const FILTER_FLAG_IPV4;
+use const FILTER_FLAG_IPV6;
+use const FILTER_VALIDATE_EMAIL;
+use const FILTER_VALIDATE_INT;
+use const FILTER_VALIDATE_IP;
+use const PHP_INT_MAX;
 
-class Tools
+final class Tools
 {
-
     /**
-     * 根据流量值自动转换单位输出
+     * Get IP location
      */
-    public static function flowAutoShow($value = 0)
+    public static function getIpLocation(string $ip): string
     {
-        $kb = 1024;
-        $mb = 1048576;
-        $gb = 1073741824;
-        $tb = $gb * 1024;
-        $pb = $tb * 1024;
-        if (abs($value) > $pb) {
-            return round($value / $pb, 2) . 'PB';
+        $data = 'GeoIP2 service not configured';
+        $city = null;
+        $country = null;
+
+        if ($_ENV['maxmind_license_key'] !== '') {
+            try {
+                $geoip = new GeoIP2();
+            } catch (InvalidDatabaseException) {
+                return $data;
+            }
+
+            try {
+                $city = $geoip->getCity($ip);
+            } catch (AddressNotFoundException|InvalidDatabaseException) {
+                $city = 'Unknown city';
+            }
+
+            try {
+                $country = $geoip->getCountry($ip);
+            } catch (AddressNotFoundException|InvalidDatabaseException) {
+                $country = 'Unknown country';
+            }
         }
 
-        if (abs($value) > $tb) {
-            return round($value / $tb, 2) . 'TB';
+        if ($country !== null) {
+            $data = $country;
         }
 
-        if (abs($value) > $gb) {
-            return round($value / $gb, 2) . 'GB';
+        if ($city !== null) {
+            $data = $city . ', ' . $country;
         }
 
-        if (abs($value) > $mb) {
-            return round($value / $mb, 2) . 'MB';
-        }
-
-        if (abs($value) > $kb) {
-            return round($value / $kb, 2) . 'KB';
-        }
-
-        return round($value, 2) . 'B';
-    }
-
-    //虽然名字是toMB，但是实际上功能是from MB to B
-    public static function toMB($traffic)
-    {
-        $mb = 1048576;
-        return $traffic * $mb;
-    }
-
-    //虽然名字是toGB，但是实际上功能是from GB to B
-    public static function toGB($traffic)
-    {
-        $gb = 1048576 * 1024;
-        return $traffic * $gb;
-    }
-
-
-    /**
-     * @param $traffic
-     * @return float
-     */
-    public static function flowToGB($traffic)
-    {
-        $gb = 1048576 * 1024;
-        return $traffic / $gb;
+        return $data;
     }
 
     /**
-     * @param $traffic
-     * @return float
+     * Auto convert bytes to human readable format
      */
-    public static function flowToMB($traffic)
+    public static function autoBytes($size, int $precision = 2): string
     {
-        $gb = 1048576;
-        return $traffic / $gb;
-    }
-
-    //获取随机字符串
-
-    public static function genRandomNum($length = 8)
-    {
-        // 来自Miku的 6位随机数 注册验证码 生成方案
-        $chars = '0123456789';
-        $char = '';
-        for ($i = 0; $i < $length; $i++) {
-            $char .= $chars[random_int(0, strlen($chars) - 1)];
+        if ($size <= 0) {
+            return '0B';
         }
-        return $char;
-    }
 
-    public static function genRandomChar($length = 8)
-    {
-        // 密码字符集，可任意添加你需要的字符
-        $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        $char = '';
-        for ($i = 0; $i < $length; $i++) {
-            $char .= $chars[random_int(0, strlen($chars) - 1)];
+        if ($size > PHP_INT_MAX) {
+            return '∞';
         }
-        return $char;
+
+        $base = log((float) $size, 1024);
+        $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+
+        return round(pow(1024, $base - floor($base)), $precision) . $units[floor($base)];
     }
 
-    public static function genToken()
+    /**
+     * Convert human readable format to bytes
+     */
+    public static function autoBytesR(string $size): int
     {
-        return self::genRandomChar(64);
+        $suffix_single = substr($size, -1);
+
+        if (is_numeric(substr($size, 0, -1)) && $suffix_single === 'B') {
+            return (int) substr($size, 0, -1);
+        }
+
+        $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+        $suffix_double = substr($size, -2);
+
+        if (! in_array($suffix_double, $units)) {
+            return -1;
+        }
+
+        $base = substr($size, 0, strlen($size) - 2);
+
+        if (! is_numeric($base) || ($base > 999 && $suffix_double === 'EB')) {
+            return -1;
+        }
+
+        return (int) ($base * pow(1024, array_flip($units)[$suffix_double]));
     }
 
-    public static function is_ip($a)
+    /**
+     * Auto convert bandwidth to human readable format
+     */
+    public static function autoMbps($size, int $precision = 2): string
     {
-        return preg_match("/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/", $a);
+        if ($size <= 0) {
+            return '0Bps';
+        }
+
+        if ($size > 1000000000) {
+            return '∞';
+        }
+
+        $base = log((float) $size, 1000);
+        $units = ['Mbps', 'Gbps', 'Tbps'];
+
+        return round(pow(1000, $base - floor($base)), $precision) . $units[floor($base)];
     }
 
+    public static function mbToB($traffic): int
+    {
+        if ($traffic <= 0 || $traffic > PHP_INT_MAX) {
+            return 0;
+        }
 
-    // Unix time to Date Time
-    public static function toDateTime($time)
+        return (int) $traffic * 1048576;
+    }
+
+    public static function gbToB($traffic): int
+    {
+        if ($traffic <= 0 || $traffic > PHP_INT_MAX) {
+            return 0;
+        }
+
+        return (int) $traffic * 1073741824;
+    }
+
+    public static function bToMB($traffic): float
+    {
+        if ($traffic <= 0 || $traffic > PHP_INT_MAX) {
+            return 0;
+        }
+
+        return round($traffic / 1048576, 2);
+    }
+
+    public static function bToGB($traffic): float
+    {
+        if ($traffic <= 0 || $traffic > PHP_INT_MAX) {
+            return 0;
+        }
+
+        return round($traffic / 1073741824, 2);
+    }
+
+    public static function genSubToken(): string
+    {
+        return self::genRandomChar(max($_ENV['sub_token_len'], 8));
+    }
+
+    public static function genRandomChar(int $length = 8): string|false
+    {
+        if ($length <= 2) {
+            $length = 2;
+        }
+
+        try {
+            $randomString = bin2hex(random_bytes((int) ceil($length / 2)));
+        } catch (RandomException) {
+            return false;
+        }
+
+        return substr($randomString, 0, $length);
+    }
+
+    public static function genSs2022UserPk(string $passwd, string $method): string|false
+    {
+        $ss2022_methods = [
+            '2022-blake3-aes-128-gcm',
+            '2022-blake3-aes-256-gcm',
+            '2022-blake3-chacha8-poly1305',
+            '2022-blake3-chacha12-poly1305',
+            '2022-blake3-chacha20-poly1305',
+        ];
+
+        if (! in_array($method, $ss2022_methods)) {
+            return false;
+        }
+
+        $passwd_hash = hash('sha3-256', $passwd);
+
+        $pk = match ($method) {
+            '2022-blake3-aes-128-gcm' => mb_strcut($passwd_hash, 0, 16),
+            default => mb_strcut($passwd_hash, 0, 32),
+        };
+
+        return base64_encode($pk);
+    }
+
+    public static function toDateTime(int $time): string
     {
         return date('Y-m-d H:i:s', $time);
     }
 
-    public static function secondsToTime($seconds)
+    public static function getSsPort(): int
     {
-        $dtF = new DateTime('@0');
-        $dtT = new DateTime("@$seconds");
-        return $dtF->diff($dtT)->format('%a 天, %h 小时, %i 分 + %s 秒');
-    }
+        $max_port = Config::obtain('max_port');
+        $min_port = Config::obtain('min_port');
 
-    public static function genSID()
-    {
-        $unid = uniqid(Config::get('key'), true);
-        return Hash::sha256WithSalt($unid);
-    }
-
-    public static function genUUID()
-    {
-        // @TODO
-        return self::genSID();
-    }
-
-    public static function getLastPort()
-    {
-        $user = User::orderBy('id', 'desc')->first();
-        if ($user == null) {
-            return 1024; // @todo
+        if ($min_port >= 65535
+            || $min_port <= 0
+            || $max_port > 65535
+            || $max_port <= 0
+            || $min_port > $max_port
+            || count(User::all()) >= $max_port - $min_port + 1
+        ) {
+            return 0;
         }
-        return $user->port;
-    }
 
-    public static function getAvPort()
-    {
-        //检索User数据表现有port
-        $det = User::pluck('port')->toArray();
-        $port = array_diff(range(Config::get('min_port'), Config::get('max_port')), $det);
+        $det = (new User())->pluck('port')->toArray();
+        $port = array_diff(range($min_port, $max_port), $det);
         shuffle($port);
+
         return $port[0];
     }
 
-    public static function base64_url_encode($input)
+    /**
+     * @param $dir
+     *
+     * @return array
+     */
+    public static function getDir($dir): array
     {
-        return strtr(base64_encode($input), array('+' => '-', '/' => '_', '=' => ''));
-    }
+        $dirArray = [];
+        $handle = opendir($dir);
 
-    public static function base64_url_decode($input)
-    {
-        return base64_decode(strtr($input, '-_', '+/'));
-    }
-
-    public static function getDir($dir)
-    {
-        $dirArray[] = null;
-        if (false != ($handle = opendir($dir))) {
+        if ($handle !== false) {
             $i = 0;
-            while (false !== ($file = readdir($handle))) {
-                if ($file != '.' && $file != '..' && !strpos($file, '.')) {
+
+            while (($file = readdir($handle)) !== false) {
+                if ($file !== '.' && $file !== '..' && ! strpos($file, '.')) {
                     $dirArray[$i] = $file;
                     $i++;
                 }
             }
+
             closedir($handle);
         }
+
         return $dirArray;
     }
 
-
-    public static function is_validate($str)
+    public static function isParamValidate($type, $str): bool
     {
-        $pattern = "/[^A-Za-z0-9\-_\.]/";
-        return !preg_match($pattern, $str);
-    }
+        $list = self::getSsMethod($type);
 
-    public static function is_relay_rule_avaliable($rule, $ruleset, $node_id)
-    {
-        $cur_id = $rule->id;
-
-        foreach ($ruleset as $single_rule) {
-            if (($rule->port == $single_rule->port || $single_rule->port == 0) && ($node_id == $single_rule->source_node_id || $single_rule->source_node_id == 0) && (($rule->id != $single_rule->id && $rule->priority < $single_rule->priority) || ($rule->id < $single_rule->id && $rule->priority == $single_rule->priority))) {
-                $cur_id = $single_rule->id;
-            }
-        }
-
-        return !($cur_id != $rule->id);
-    }
-
-    public static function pick_out_relay_rule($relay_node_id, $port, $ruleset)
-    {
-
-        /*
-        for id in self.relay_rule_list:
-            if ((self.relay_rule_list[id]['user_id'] == user_id or self.relay_rule_list[id]['user_id'] == 0) or row['is_multi_user'] != 0) and (self.relay_rule_list[id]['port'] == 0 or self.relay_rule_list[id]['port'] == port):
-                has_higher_priority = False
-                for priority_id in self.relay_rule_list:
-                    if ((self.relay_rule_list[priority_id]['priority'] > self.relay_rule_list[id]['priority'] and self.relay_rule_list[id]['id'] != self.relay_rule_list[priority_id]['id']) or (self.relay_rule_list[priority_id]['priority'] == self.relay_rule_list[id]['priority'] and self.relay_rule_list[id]['id'] > self.relay_rule_list[priority_id]['id'])) and (self.relay_rule_list[id]['user_id'] == self.relay_rule_list[priority_id]['user_id'] or self.relay_rule_list[priority_id]['user_id'] == 0) and (self.relay_rule_list[id]['port'] == self.relay_rule_list[priority_id]['port'] or self.relay_rule_list[priority_id]['port'] == 0):
-                        has_higher_priority = True
-                        continue
-
-                if has_higher_priority:
-                    continue
-
-            temp_relay_rules[id] = self.relay_rule_list[id]
-        */
-
-        $match_rule = null;
-
-        foreach ($ruleset as $single_rule) {
-            if (($single_rule->port == $port || $single_rule->port == 0) && ($single_rule->source_node_id == 0 || $single_rule->source_node_id == $relay_node_id)) {
-                $has_higher_priority = false;
-                foreach ($ruleset as $priority_rule) {
-                    if (($priority_rule->port == $port || $priority_rule->port == 0) && ($priority_rule->source_node_id == 0 || $priority_rule->source_node_id == $relay_node_id)) {
-                        if (($priority_rule->priority > $single_rule->priority && $priority_rule->id != $single_rule->id) || ($priority_rule->priority == $single_rule->priority && $priority_rule->id < $single_rule->id)) {
-                            $has_higher_priority = true;
-                            continue;
-                        }
-                    }
-                }
-
-                if ($has_higher_priority) {
-                    continue;
-                }
-
-                $match_rule = $single_rule;
-            }
-        }
-
-        if (($match_rule != null) && $match_rule->dist_node_id == -1) {
-            return null;
-        }
-
-        return $match_rule;
-    }
-
-    public static function get_middle_text($origin_text, $begin_text, $end_text)
-    {
-        $begin_pos = strpos($origin_text, $begin_text);
-        if ($begin_pos == false) {
-            return null;
-        }
-
-        $end_pos = strpos($origin_text, $end_text, $begin_pos + strlen($begin_text));
-        if ($end_pos == false) {
-            return null;
-        }
-
-        return substr($origin_text, $begin_pos + strlen($begin_text), $end_pos - $begin_pos - strlen($begin_text));
-    }
-
-    public static function is_param_validate($type, $str)
-    {
-        $list = Config::getSupportParam($type);
         if (in_array($str, $list)) {
             return true;
         }
+
         return false;
     }
 
-    public static function is_protocol_relay($user)
+    public static function getSsMethod(string $type = ''): array
     {
+        return match ($type) {
+            'ss_obfs' => [
+                'simple_obfs_http',
+                'simple_obfs_http_compatible',
+                'simple_obfs_tls',
+                'simple_obfs_tls_compatible',
+            ],
+            default => [
+                'aes-128-gcm',
+                'aes-192-gcm',
+                'aes-256-gcm',
+                'chacha20-ietf-poly1305',
+                'xchacha20-ietf-poly1305',
+            ],
+        };
+    }
+
+    public static function isEmail($input): bool
+    {
+        if (! filter_var($input, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+
         return true;
-
-        $relay_able_list = Config::getSupportParam('relay_able_protocol');
-
-        return in_array($user->protocol, $relay_able_list) || Config::get('relay_insecure_mode') == true;
     }
 
-    public static function has_conflict_rule($input_rule, $ruleset, $edit_rule_id = 0, $origin_node_id = 0, $user_id = 0)
+    public static function isIPv4($input): bool
     {
-        foreach ($ruleset as $rule) {
-            if (($rule->source_node_id == $input_rule->dist_node_id) && (($rule->port == $input_rule->port || $input_rule->port == 0) || $rule->port == 0)) {
-                if ($rule->dist_node_id == $origin_node_id && $rule->id != $edit_rule_id) {
-                    return $rule->id;
-                }
-
-                //递归处理这个节点
-                $maybe_rule_id = self::has_conflict_rule($rule, $ruleset, $edit_rule_id, $origin_node_id, $rule->user_id);
-                if ($maybe_rule_id != 0) {
-                    return $maybe_rule_id;
-                }
-            }
+        if (! filter_var($input, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            return false;
         }
 
-        if (($input_rule->id == $edit_rule_id || $edit_rule_id == 0) && $input_rule->dist_node_id != -1) {
-            $dist_node = Node::find($input_rule->dist_node_id);
-            if ($input_rule->source_node_id == 0 && ($dist_node->sort == 10 || $dist_node->sort == 12)) {
-                return -1;
-            }
-
-            if ($input_rule->dist_node_id == $input_rule->source_node_id) {
-                return -1;
-            }
-        }
-
-        return 0;
+        return true;
     }
 
-    public static function insertPathRule($single_rule, $pathset, $port)
+    public static function isIPv6($input): bool
     {
-        /* path
-          path pathtext
-          begin_node_id id
-          end_node id
-          port port
-        */
-
-        if ($single_rule->dist_node_id == -1) {
-            return $pathset;
+        if (! filter_var($input, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            return false;
         }
 
-        foreach ($pathset as &$path) {
-            if ($path->port == $port) {
-                if ($single_rule->dist_node_id == $path->begin_node->id) {
-                    $path->begin_node = $single_rule->Source_Node();
-                    if ($path->begin_node->isNodeAccessable() == false) {
-                        $path->path = '<font color="#FF0000">' . $single_rule->Source_Node()->name . '</font>' . ' → ' . $path->path;
-                        $path->status = '阻断';
-                    } else {
-                        $path->path = $single_rule->Source_Node()->name . ' → ' . $path->path;
-                        $path->status = '通畅';
-                    }
-                    return $pathset;
-                }
-
-                if ($path->end_node->id == $single_rule->source_node_id) {
-                    $path->end_node = $single_rule->Dist_Node();
-                    if ($path->end_node->isNodeAccessable() == false) {
-                        $path->path = $path->path . ' → ' . '<font color="#FF0000">' . $single_rule->Dist_Node()->name . '</font>';
-                        $path->status = '阻断';
-                    } else {
-                        $path->path = $path->path . ' → ' . $single_rule->Dist_Node()->name;
-                    }
-                    return $pathset;
-                }
-            }
-        }
-
-        $new_path = new \stdClass();
-        $new_path->begin_node = $single_rule->Source_Node();
-        if ($new_path->begin_node->isNodeAccessable() == false) {
-            $new_path->path = '<font color="#FF0000">' . $single_rule->Source_Node()->name . '</font>';
-            $new_path->status = '阻断';
-        } else {
-            $new_path->path = $single_rule->Source_Node()->name;
-            $new_path->status = '通畅';
-        }
-
-        $new_path->end_node = $single_rule->Dist_Node();
-        if ($new_path->end_node->isNodeAccessable() == false) {
-            $new_path->path .= ' -> ' . '<font color="#FF0000">' . $single_rule->Dist_Node()->name . '</font>';
-            $new_path->status = '阻断';
-        } else {
-            $new_path->path .= ' -> ' . $single_rule->Dist_Node()->name;
-        }
-
-        $new_path->port = $port;
-        $pathset->append($new_path);
-
-        return $pathset;
+        return true;
     }
 
-    public static function keyFilter($object, $filter_array)
+    public static function isInt($input): bool
     {
-        foreach ($object['attributes'] as $key => $value) {
-            if (!in_array($key, $filter_array)) {
-                unset($object->$key);
-            }
+        if (! filter_var($input, FILTER_VALIDATE_INT)) {
+            return false;
         }
-        return $object;
+
+        return true;
     }
 
-    public static function getRelayNodeIp($source_node, $dist_node)
-    {
-        $dist_ip_str = $dist_node->node_ip;
-        $dist_ip_array = explode(',', $dist_ip_str);
-        $return_ip = null;
-        foreach ($dist_ip_array as $single_dist_ip_str) {
-            $child1_array = explode('#', $single_dist_ip_str);
-            if ($child1_array[0] == $single_dist_ip_str) {
-                $return_ip = $child1_array[0];
-            } elseif (isset($child1_array[1])) {
-                $node_id_array = explode('|', $child1_array[1]);
-                if (in_array($source_node->id, $node_id_array)) {
-                    $return_ip = $child1_array[0];
-                }
-            }
-        }
-
-        return $return_ip;
-    }
-
-    public static function updateRelayRuleIp($dist_node)
-    {
-        $rules = Relay::where('dist_node_id', $dist_node->id)->get();
-
-        foreach ($rules as $rule) {
-            $source_node = Node::where('id', $rule->source_node_id)->first();
-
-            $rule->dist_ip = self::getRelayNodeIp($source_node, $dist_node);
-            $rule->save();
-        }
-    }
-
-    public static function checkNoneProtocol($user)
-    {
-        return !($user->method == 'none' && !in_array($user->protocol, Config::getSupportParam('allow_none_protocol')));
-    }
-
-    public static function getRealIp($rawIp)
-    {
-        return str_replace('::ffff:', '', $rawIp);
-    }
-
-    public static function isInt($str)
-    {
-        if ($str[0] == '-') {
-            $str = substr($str, 1);
-        }
-
-        return ctype_digit($str);
-    }
-
-    public static function v2Array($node)
-    {
-        $server = explode(';', $node);
-        $item = [
-            'host' => '',
-            'path' => '',
-            'tls' => ''
-        ];
-        $item['add'] = $server[0];
-        if ($server[1] == '0' || $server[1] == '') {
-            $item['port'] = 443;
-        } else {
-            $item['port'] = (int)$server[1];
-        }
-        $item['aid'] = (int)$server[2];
-        $item['net'] = 'tcp';
-        $item['type'] = 'none';
-        if (count($server) >= 4) {
-            $item['net'] = $server[3];
-            if ($item['net'] == 'ws') {
-                $item['path'] = '/';
-            } elseif ($item['net'] == 'tls') {
-                $item['tls'] = 'tls';
-            }
-        }
-        if (count($server) >= 5) {
-            if (in_array($item['net'], array('kcp', 'http'))) {
-                $item['type'] = $server[4];
-            } elseif ($server[4] == 'ws') {
-                $item['net'] = 'ws';
-            }
-        }
-        if (count($server) >= 6) {
-            $item = array_merge($item, URL::parse_args($server[5]));
-            if (array_key_exists('server', $item)) {
-                $item['add'] = $item['server'];
-                unset($item['server']);
-            }
-            if (array_key_exists('outside_port', $item)) {
-                $item['port'] = (int)$item['outside_port'];
-                unset($item['outside_port']);
-            }
-        }
-        return $item;
-    }
-
-    public static function checkTls($node)
-    {
-        $server = self::v2Array($node);
-        return !($server['tls'] == 'tls' && self::is_ip($server['add']));
-    }
-
-    public static function ssv2Array($node)
-    {
-        $server = explode(';', $node);
-        $item = [
-            'host' => '',
-            'path' => '',
-            'net' => 'ws',
-            'tls' => ''
-        ];
-        $item['add'] = $server[0];
-        if ($server[1] == '0' || $server[1] == '') {
-            $item['port'] = 443;
-        } else {
-            $item['port'] = (int)$server[1];
-        }
-        if (count($server) >= 4) {
-            $item['net'] = $server[3];
-            if ($item['net'] == 'ws') {
-                $item['path'] = '/';
-            } elseif ($item['net'] == 'tls') {
-                $item['tls'] = 'tls';
-            }
-        }
-        if (count($server) >= 5 && $server[4] == 'ws') {
-            $item['net'] = 'ws';
-        } elseif (count($server) >= 5 && $server[4] == 'tls') {
-            $item['tls'] = 'tls';
-        }
-        if (count($server) >= 6) {
-            $item = array_merge($item, URL::parse_args($server[5]));
-            if (array_key_exists('server', $item)) {
-                $item['add'] = $item['server'];
-                unset($item['server']);
-            }
-            if (array_key_exists('outside_port', $item)) {
-                $item['port'] = (int)$item['outside_port'];
-                unset($item['outside_port']);
-            }
-        }
-        return $item;
-    }
-
-    /** 
-     * Add files and sub-directories in a folder to zip file. 
-     * 
-     * @param string     $folder 
-     * @param ZipArchive $zipFile 
-     * @param int        $exclusiveLength Number of text to be exclusived from the file path. 
+    /**
+     * Check if string is valid JSON
+     * TODO: Remove this function when PHP 8.3 is minimum requirement and replace it with native function
      */
-    public static function folderToZip($folder, &$zipFile, $exclusiveLength)
+    public static function isJson(string $string): bool
     {
-        $handle = opendir($folder);
-        while (false !== $f = readdir($handle)) {
-            if ($f != '.' && $f != '..') {
-                $filePath = "$folder/$f";
-                // Remove prefix from file path before add to zip. 
-                $localPath = substr($filePath, $exclusiveLength);
-                if (is_file($filePath)) {
-                    $zipFile->addFile($filePath, $localPath);
-                } elseif (is_dir($filePath)) {
-                    // Add sub-directory. 
-                    $zipFile->addEmptyDir($localPath);
-                    self::folderToZip($filePath, $zipFile, $exclusiveLength);
-                }
-            }
+        if (! json_decode($string)) {
+            return false;
         }
-        closedir($handle);
+
+        return true;
+    }
+
+    /**
+     * Get site domain
+     */
+    public static function getSiteDomain(): string
+    {
+        return parse_url($_ENV['baseUrl'], PHP_URL_HOST);
     }
 }

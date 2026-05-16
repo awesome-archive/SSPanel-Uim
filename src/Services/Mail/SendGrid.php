@@ -1,53 +1,40 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Services\Mail;
 
-use App\Services\Config;
-use SendGrid\Attachment;
-use SendGrid\Content;
-use SendGrid\Email;
-use SendGrid\Mail;
+use App\Models\Config;
+use SendGrid as SG;
+use SendGrid\Mail\Mail;
+use SendGrid\Mail\TypeException;
 
-class SendGrid extends Base
+final class SendGrid extends Base
 {
-    private $config;
-    private $sg;
-    private $sender;
+    private SG $sg;
+    private Mail $email;
 
+    /**
+     * @throws TypeException
+     */
     public function __construct()
     {
-        $this->config = $this->getConfig();
-        $this->sg = new \SendGrid($this->config['key']);
-        $this->sender = $this->config['sender'];
+        $configs = Config::getClass('email');
+
+        $this->sg = new SG($configs['sendgrid_key']);
+        $this->email = new Mail();
+        $this->email->setFrom($configs['sendgrid_sender'], $configs['sendgrid_name']);
     }
 
-    public function getConfig()
+    /**
+     * @throws TypeException
+     */
+    public function send($to, $subject, $body): void
     {
-        return [
-            'key' => Config::get('sendgrid_key'),
-            'sender' => Config::get('sendgrid_sender')
-        ];
-    }
+        $this->email->setSubject($subject);
+        $this->email->addTo($to);
+        $this->email->addContent('text/html', $body);
 
-    public function send($to_address, $subject_raw, $text, $files)
-    {
-        $from = new Email(null, $this->sender);
-        $subject = $subject_raw;
-        $to = new Email(null, $to_address);
-        $content = new Content('text/html', $text);
-        $mail = new Mail($from, $subject, $to, $content);
-
-        foreach ($files as $file) {
-            $attachment = new Attachment();
-            $attachment->setContent(base64_encode(file_get_contents($file)));
-            $attachment->setType('application/octet-stream');
-            $attachment->setFilename(basename($file));
-            $attachment->setDisposition('attachment');
-            $attachment->setContentId('backup');
-            $mail->addAttachment($attachment);
-        }
-
-        $response = $this->sg->client->mail()->send()->post($mail);
-        echo $response->body();
+        $this->sg->send($this->email);
     }
 }

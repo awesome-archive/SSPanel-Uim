@@ -1,588 +1,495 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Controllers;
 
+use App\Models\Config;
 use App\Models\InviteCode;
-use App\Services\Config;
-use App\Utils\Check;
-use App\Utils\Tools;
-use App\Utils\Radius;
-use Exception;
-use voku\helper\AntiXSS;
-use App\Utils\Hash;
-use App\Utils\Da;
-use App\Services\Auth;
-use App\Services\Mail;
-use App\Models\User;
 use App\Models\LoginIp;
-use App\Models\EmailVerify;
-use App\Utils\GA;
-use App\Utils\Geetest;
-use App\Utils\TelegramSessionManager;
+use App\Models\User;
+use App\Services\Auth;
+use App\Services\Cache;
+use App\Services\Captcha;
+use App\Services\Filter;
+use App\Services\Mail;
+use App\Services\MFA\FIDO;
+use App\Services\MFA\TOTP;
+use App\Services\MFA\WebAuthn;
+use App\Services\RateLimit;
+use App\Services\Reward;
+use App\Utils\Cookie;
+use App\Utils\Hash;
+use App\Utils\ResponseHelper;
+use App\Utils\Tools;
+use Exception;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Message\ResponseInterface;
+use Ramsey\Uuid\Uuid;
+use RedisException;
+use Slim\Http\Response;
+use Slim\Http\ServerRequest;
+use function array_rand;
+use function date;
+use function explode;
+use function strlen;
+use function strtolower;
+use function time;
+use function trim;
 
-/**
- *  AuthController
- */
-class AuthController extends BaseController
+final class AuthController extends BaseController
 {
-    public function login()
+    /**
+     * @throws Exception
+     */
+    public function login(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $GtSdk = null;
-        $recaptcha_sitekey = null;
-        if (Config::get('enable_login_captcha') === true) {
-            switch (Config::get('captcha_provider')) {
-                case 'recaptcha':
-                    $recaptcha_sitekey = Config::get('recaptcha_sitekey');
-                    break;
-                case 'geetest':
-                    $uid = time() . random_int(1, 10000);
-                    $GtSdk = Geetest::get($uid);
-                    break;
-            }
+        $captcha = [];
+
+        if (Config::obtain('enable_login_captcha')) {
+            $captcha = Captcha::generate();
         }
 
-        if (Config::get('enable_telegram') === true) {
-            $login_text = TelegramSessionManager::add_login_session();
-            $login = explode('|', $login_text);
-            $login_token = $login[0];
-            $login_number = $login[1];
-        } else {
-            $login_token = '';
-            $login_number = '';
-        }
-
-        return $this->view()
-            ->assign('geetest_html', $GtSdk)
-            ->assign('login_token', $login_token)
-            ->assign('login_number', $login_number)
-            ->assign('telegram_bot', Config::get('telegram_bot'))
-            ->assign('base_url', Config::get('baseUrl'))
-            ->assign('recaptcha_sitekey', $recaptcha_sitekey)
-            ->display('auth/login.tpl');
+        return $response->write($this->view()
+            ->assign('base_url', $_ENV['baseUrl'])
+            ->assign('captcha', $captcha)
+            ->fetch('auth/login.tpl'));
     }
 
-    public function getCaptcha($request, $response, $args)
+    public function loginHandle(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $GtSdk = null;
-        $recaptcha_sitekey = null;
-        if (Config::get('captcha_provider') != '') {
-            switch (Config::get('captcha_provider')) {
-                case 'recaptcha':
-                    $recaptcha_sitekey = Config::get('recaptcha_sitekey');
-                    $res['recaptchaKey'] = $recaptcha_sitekey;
-                    break;
-                case 'geetest':
-                    $uid = time() . random_int(1, 10000);
-                    $GtSdk = Geetest::get($uid);
-                    $res['GtSdk'] = $GtSdk;
-                    break;
-            }
+        if (Config::obtain('enable_login_captcha') && ! Captcha::verify($request->getParams())) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '系统无法接受你的验证结果，请刷新页面后重试。',
+            ]);
         }
 
-        $res['respon'] = 1;
-        return $response->getBody()->write(json_encode($res));
-    }
+        $password = $request->getParam('password');
+        $rememberMe = $request->getParam('remember_me') === 'true' ? 1 : 0;
+        $email = strtolower(trim($this->antiXss->xss_clean($request->getParam('email'))));
+        $redir = $this->antiXss->xss_clean(Cookie::get('redir')) ?? '/user';
+        $user = (new User())->where('email', $email)->first();
+        $loginIp = new LoginIp();
 
-    public function loginHandle($request, $response, $args)
-    {
-        // $data = $request->post('sdf');
-        $email = $request->getParam('email');
-        $email = trim($email);
-        $email = strtolower($email);
-        $passwd = $request->getParam('passwd');
-        $code = $request->getParam('code');
-        $rememberMe = $request->getParam('remember_me');
+        if ($user === null) {
+            $loginIp->collectLoginIP($_SERVER['REMOTE_ADDR'], 1);
 
-        if (Config::get('enable_login_captcha') === true) {
-            switch (Config::get('captcha_provider')) {
-                case 'recaptcha':
-                    $recaptcha = $request->getParam('recaptcha');
-                    if ($recaptcha == '') {
-                        $ret = false;
-                    } else {
-                        $json = file_get_contents('https://recaptcha.net/recaptcha/api/siteverify?secret=' . Config::get('recaptcha_secret') . '&response=' . $recaptcha);
-                        $ret = json_decode($json)->success;
-                    }
-                    break;
-                case 'geetest':
-                    $ret = Geetest::verify($request->getParam('geetest_challenge'), $request->getParam('geetest_validate'), $request->getParam('geetest_seccode'));
-                    break;
-            }
-            if (!$ret) {
-                $res['ret'] = 0;
-                $res['msg'] = '系统无法接受您的验证结果，请刷新页面后重试。';
-                return $response->getBody()->write(json_encode($res));
-            }
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '邮箱或者密码错误',
+            ]);
         }
 
-        // Handle Login
-        $user = User::where('email', '=', $email)->first();
+        if (! Hash::checkPassword($user->pass, $password)) {
+            $loginIp->collectLoginIP($_SERVER['REMOTE_ADDR'], 1, $user->id);
 
-        if ($user == null) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '邮箱不存在';
-            return $response->getBody()->write(json_encode($rs));
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '邮箱或者密码错误',
+            ]);
         }
 
-        if (!Hash::checkPassword($user->pass, $passwd)) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '邮箱或者密码错误';
+        $mfaStatus = $user->checkMfaStatus();
+        if ($mfaStatus['require']) {
+            $redis = (new Cache())->initRedis();
+            $redis->setex('mfa_login_' . session_id(), 300, json_encode([
+                'userid' => $user->id,
+                'method' => $mfaStatus,
+                'redir' => $redir,
+                'remember_me' => $rememberMe,
+            ]));
 
-
-            $loginIP = new LoginIp();
-            $loginIP->ip = $_SERVER['REMOTE_ADDR'];
-            $loginIP->userid = $user->id;
-            $loginIP->datetime = time();
-            $loginIP->type = 1;
-            $loginIP->save();
-
-            return $response->getBody()->write(json_encode($rs));
+            return $response
+                ->withHeader('HX-Redirect', '/auth/mfa')
+                ->withJson([
+                    'ret' => 1,
+                    'msg' => '请完成二步认证',
+                ]);
         }
 
-        $time = 3600 * 24;
-        if ($rememberMe) {
-            $time = 3600 * 24 * (Config::get('rememberMeDuration') ?: 7);
-        }
-
-        if ($user->ga_enable == 1) {
-            $ga = new GA();
-            $rcode = $ga->verifyCode($user->ga_token, $code);
-
-            if (!$rcode) {
-                $res['ret'] = 0;
-                $res['msg'] = '两步验证码错误，如果您是丢失了生成器或者错误地设置了这个选项，您可以尝试重置密码，即可取消这个选项。';
-                return $response->getBody()->write(json_encode($res));
-            }
-        }
+        $time = $rememberMe ? 86400 * ($_ENV['rememberMeDuration'] ?? 7) : 3600; // Cookie 过期时间
 
         Auth::login($user->id, $time);
-        $rs['ret'] = 1;
-        $rs['msg'] = '登录成功';
+        // 记录登录成功
+        $loginIp->collectLoginIP($_SERVER['REMOTE_ADDR'], 0, $user->id);
+        $user->last_login_time = time();
+        $user->save();
 
-        $loginIP = new LoginIp();
-        $loginIP->ip = $_SERVER['REMOTE_ADDR'];
-        $loginIP->userid = $user->id;
-        $loginIP->datetime = time();
-        $loginIP->type = 0;
-        $loginIP->save();
-
-        return $response->getBody()->write(json_encode($rs));
+        return $response->withHeader('HX-Redirect', $redir);
     }
 
-    public function qrcode_loginHandle($request, $response, $args)
+    public function mfaPage(ServerRequest $request, Response $response, $next): ResponseInterface
     {
-        // $data = $request->post('sdf');
-        $token = $request->getParam('token');
-        $number = $request->getParam('number');
+        $redis = (new Cache())->initRedis();
+        $mfa_session = $redis->get('mfa_login_' . session_id());
+        if ($mfa_session === false) {
+            return $response->withStatus(302)->withHeader('Location', '/auth/login');
+        }
+        $mfa_session = json_decode($mfa_session, true);
+        return $response->write(
+            $this->view()
+                ->assign('base_url', $_ENV['baseUrl'])
+                ->assign('method', $mfa_session['method'])
+                ->fetch('auth/mfa.tpl')
+        );
+    }
 
-        $ret = TelegramSessionManager::step2_verify_login_session($token, $number);
-        if (!$ret) {
-            $res['ret'] = 0;
-            $res['msg'] = '此令牌无法被使用。';
-            return $response->getBody()->write(json_encode($res));
+    /**
+     * @throws Exception
+     */
+    public function register(ServerRequest $request, Response $response, $next): ResponseInterface
+    {
+        $captcha = [];
+
+        if (Config::obtain('enable_reg_captcha')) {
+            $captcha = Captcha::generate();
         }
 
+        $invite_code = $this->antiXss->xss_clean($request->getParam('code'));
 
-        // Handle Login
-        $user = User::where('id', '=', $ret)->first();
-        // @todo
-        $time = 3600 * 24;
-
-        Auth::login($user->id, $time);
-        $rs['ret'] = 1;
-        $rs['msg'] = '登录成功';
-
-        $this->logUserIp($user->id, $_SERVER['REMOTE_ADDR']);
-
-        return $response->getBody()->write(json_encode($rs));
+        return $response->write(
+            $this->view()
+                ->assign('invite_code', $invite_code)
+                ->assign('base_url', $_ENV['baseUrl'])
+                ->assign('captcha', $captcha)
+                ->fetch('auth/register.tpl')
+        );
     }
 
-    private function logUserIp($id, $ip)
+    /**
+     * @throws RedisException
+     */
+    public function sendVerify(ServerRequest $request, Response $response, $next): ResponseInterface
     {
-        $loginip = new LoginIp();
-        $loginip->ip = $ip;
-        $loginip->userid = $id;
-        $loginip->datetime = time();
-        $loginip->type = 0;
-        $loginip->save();
-    }
+        if (Config::obtain('reg_email_verify')) {
+            $email = strtolower(trim($this->antiXss->xss_clean($request->getParam('email'))));
 
-    public function register($request, $response, $next)
-    {
-        $ary = $request->getQueryParams();
-        $code = '';
-        if (isset($ary['code'])) {
-            $antiXss = new AntiXSS();
-            $code = $antiXss->xss_clean($ary['code']);
-        }
-
-        $GtSdk = null;
-        $recaptcha_sitekey = null;
-        if (Config::get('enable_reg_captcha') === true) {
-            switch (Config::get('captcha_provider')) {
-                case 'recaptcha':
-                    $recaptcha_sitekey = Config::get('recaptcha_sitekey');
-                    break;
-                case 'geetest':
-                    $uid = time() . random_int(1, 10000);
-                    $GtSdk = Geetest::get($uid);
-                    break;
-            }
-        }
-
-
-        return $this->view()
-            ->assign('geetest_html', $GtSdk)
-            ->assign('enable_email_verify', Config::get('enable_email_verify'))
-            ->assign('code', $code)
-            ->assign('recaptcha_sitekey', $recaptcha_sitekey)
-            ->display('auth/register.tpl');
-    }
-
-
-    public function sendVerify($request, $response, $next)
-    {
-        if (Config::get('enable_email_verify') == true) {
-            $email = $request->getParam('email');
-            $email = trim($email);
-
-            if ($email == '') {
-                $res['ret'] = 0;
-                $res['msg'] = '未填写邮箱';
-                return $response->getBody()->write(json_encode($res));
+            if ($email === '') {
+                return ResponseHelper::error($response, '未填写邮箱');
             }
 
             // check email format
-            if (!Check::isEmailLegal($email)) {
-                $res['ret'] = 0;
-                $res['msg'] = '邮箱无效';
-                return $response->getBody()->write(json_encode($res));
+            $email_check = Filter::checkEmailFilter($email);
+
+            if (! $email_check) {
+                return ResponseHelper::error($response, '无效的邮箱');
             }
 
-            $user = User::where('email', '=', $email)->first();
-            if ($user != null) {
-                $res['ret'] = 0;
-                $res['msg'] = '此邮箱已经注册';
-                return $response->getBody()->write(json_encode($res));
+            if (! (new RateLimit())->checkRateLimit('email_request_ip', $request->getServerParam('REMOTE_ADDR')) ||
+                ! (new RateLimit())->checkRateLimit('email_request_address', $email)
+            ) {
+                return ResponseHelper::error($response, '你的请求过于频繁，请稍后再试');
             }
 
-            $ipcount = EmailVerify::where('ip', '=', $_SERVER['REMOTE_ADDR'])->where('expire_in', '>', time())->count();
-            if ($ipcount >= (int)Config::get('email_verify_iplimit')) {
-                $res['ret'] = 0;
-                $res['msg'] = '此IP请求次数过多';
-                return $response->getBody()->write(json_encode($res));
+            $user = (new User())->where('email', $email)->first();
+
+            if ($user !== null) {
+                return ResponseHelper::error($response, '此邮箱已经注册');
             }
 
-
-            $mailcount = EmailVerify::where('email', '=', $email)->where('expire_in', '>', time())->count();
-            if ($mailcount >= 3) {
-                $res['ret'] = 0;
-                $res['msg'] = '此邮箱请求次数过多';
-                return $response->getBody()->write(json_encode($res));
-            }
-
-            $code = Tools::genRandomNum(6);
-
-            $ev = new EmailVerify();
-            $ev->expire_in = time() + Config::get('email_verify_ttl');
-            $ev->ip = $_SERVER['REMOTE_ADDR'];
-            $ev->email = $email;
-            $ev->code = $code;
-            $ev->save();
-
-            $subject = Config::get('appName') . '- 验证邮件';
+            $email_code = Tools::genRandomChar(6);
+            $redis = (new Cache())->initRedis();
+            $redis->setex('email_verify:' . $email_code, Config::obtain('email_verify_code_ttl'), $email);
 
             try {
-                Mail::send($email, $subject, 'auth/verify.tpl', [
-                    'code' => $code, 'expire' => date('Y-m-d H:i:s', time() + Config::get('email_verify_ttl'))
-                ], [
-                    //BASE_PATH.'/public/assets/email/styles.css'
-                ]);
-            } catch (Exception $e) {
-                $res['ret'] = 1;
-                $res['msg'] = '邮件发送失败，请联系网站管理员。';
-                return $response->getBody()->write(json_encode($res));
+                Mail::send(
+                    $email,
+                    $_ENV['appName'] . '- 验证邮件',
+                    'verify_code.tpl',
+                    [
+                        'code' => $email_code,
+                        'expire' => date('Y-m-d H:i:s', time() + Config::obtain('email_verify_code_ttl')),
+                    ]
+                );
+            } catch (Exception|ClientExceptionInterface) {
+                return ResponseHelper::error($response, '邮件发送失败，请联系网站管理员。');
             }
 
-            $res['ret'] = 1;
-            $res['msg'] = '验证码发送成功，请查收邮件。';
-            return $response->getBody()->write(json_encode($res));
+            return ResponseHelper::success($response, '验证码发送成功，请查收邮件。');
         }
-        $res['ret'] = 0;
-        return $response->getBody()->write(json_encode($res));
+
+        return ResponseHelper::error($response, '站点未启用邮件验证');
     }
 
-    public function registerHandle($request, $response)
-    {
-        if (Config::get('register_mode') === 'close') {
-            $res['ret'] = 0;
-            $res['msg'] = '未开放注册。';
-            return $response->getBody()->write(json_encode($res));
-        }
-        $name = $request->getParam('name');
-        $email = $request->getParam('email');
-        $email = trim($email);
-        $email = strtolower($email);
-        $passwd = $request->getParam('passwd');
-        $repasswd = $request->getParam('repasswd');
-        $code = $request->getParam('code');
-        $code = trim($code);
-        $imtype = $request->getParam('imtype');
-        $emailcode = $request->getParam('emailcode');
-        $emailcode = trim($emailcode);
-        $wechat = $request->getParam('wechat');
-        $wechat = trim($wechat);
-        // check code
-
-
-        if (Config::get('enable_reg_captcha') === true) {
-            switch (Config::get('captcha_provider')) {
-                case 'recaptcha':
-                    $recaptcha = $request->getParam('recaptcha');
-                    if ($recaptcha == '') {
-                        $ret = false;
-                    } else {
-                        $json = file_get_contents('https://recaptcha.net/recaptcha/api/siteverify?secret=' . Config::get('recaptcha_secret') . '&response=' . $recaptcha);
-                        $ret = json_decode($json)->success;
-                    }
-                    break;
-                case 'geetest':
-                    $ret = Geetest::verify($request->getParam('geetest_challenge'), $request->getParam('geetest_validate'), $request->getParam('geetest_seccode'));
-                    break;
-            }
-            if (!$ret) {
-                $res['ret'] = 0;
-                $res['msg'] = '系统无法接受您的验证结果，请刷新页面后重试。';
-                return $response->getBody()->write(json_encode($res));
-            }
-        }
-
-
-        //dumplin：1、邀请人等级为0则邀请码不可用；2、邀请人invite_num为可邀请次数，填负数则为无限
-        $c = InviteCode::where('code', $code)->first();
-        if ($c == null) {
-            if (Config::get('register_mode') === 'invite') {
-                $res['ret'] = 0;
-                $res['msg'] = '邀请码无效';
-                return $response->getBody()->write(json_encode($res));
-            }
-        } elseif ($c->user_id != 0) {
-            $gift_user = User::where('id', '=', $c->user_id)->first();
-            if ($gift_user == null) {
-                $res['ret'] = 0;
-                $res['msg'] = '邀请人不存在';
-                return $response->getBody()->write(json_encode($res));
-            }
-
-            if ($gift_user->class == 0) {
-                $res['ret'] = 0;
-                $res['msg'] = '邀请人不是VIP';
-                return $response->getBody()->write(json_encode($res));
-            }
-
-            if ($gift_user->invite_num == 0) {
-                $res['ret'] = 0;
-                $res['msg'] = '邀请人可用邀请次数为0';
-                return $response->getBody()->write(json_encode($res));
-            }
-        }
-
-
-        // check email format
-        if (!Check::isEmailLegal($email)) {
-            $res['ret'] = 0;
-            $res['msg'] = '邮箱无效';
-            return $response->getBody()->write(json_encode($res));
-        }
-        // check email
-        $user = User::where('email', $email)->first();
-        if ($user != null) {
-            $res['ret'] = 0;
-            $res['msg'] = '邮箱已经被注册了';
-            return $response->getBody()->write(json_encode($res));
-        }
-
-        if (Config::get('enable_email_verify') == true) {
-            $mailcount = EmailVerify::where('email', '=', $email)->where('code', '=', $emailcode)->where('expire_in', '>', time())->first();
-            if ($mailcount == null) {
-                $res['ret'] = 0;
-                $res['msg'] = '您的邮箱验证码不正确';
-                return $response->getBody()->write(json_encode($res));
-            }
-        }
-
-        // check pwd length
-        if (strlen($passwd) < 8) {
-            $res['ret'] = 0;
-            $res['msg'] = '密码请大于8位';
-            return $response->getBody()->write(json_encode($res));
-        }
-
-        // check pwd re
-        if ($passwd != $repasswd) {
-            $res['ret'] = 0;
-            $res['msg'] = '两次密码输入不符';
-            return $response->getBody()->write(json_encode($res));
-        }
-
-        if ($imtype == '' || $wechat == '') {
-            $res['ret'] = 0;
-            $res['msg'] = '请填上你的联络方式';
-            return $response->getBody()->write(json_encode($res));
-        }
-
-        $user = User::where('im_value', $wechat)->where('im_type', $imtype)->first();
-        if ($user != null) {
-            $res['ret'] = 0;
-            $res['msg'] = '此联络方式已注册';
-            return $response->getBody()->write(json_encode($res));
-        }
-        if (Config::get('enable_email_verify') == true) {
-            EmailVerify::where('email', '=', $email)->delete();
-        }
+    /**
+     * @throws Exception
+     */
+    public function registerHelper(
+        Response $response,
+        $name,
+        $email,
+        $password,
+        $invite_code,
+        $imtype,
+        $imvalue,
+        $money,
+        $is_admin_reg
+    ): ResponseInterface {
+        $redir = $this->antiXss->xss_clean(Cookie::get('redir')) ?? '/user';
+        $configs = Config::getClass('reg');
         // do reg user
         $user = new User();
 
-        $antiXss = new AntiXSS();
-
-
-        $user->user_name = $antiXss->xss_clean($name);
+        $user->user_name = $name;
         $user->email = $email;
-        $user->pass = Hash::passwordHash($passwd);
-        $user->passwd = Tools::genRandomChar(6);
-        $user->port = Tools::getAvPort();
-        $user->t = 0;
+        $user->remark = '';
+        $user->pass = Hash::passwordHash($password);
+        $user->passwd = Tools::genRandomChar(16);
+        $user->uuid = Uuid::uuid4();
+        $user->api_token = Tools::genRandomChar(32);
+        $user->port = Tools::getSsPort();
         $user->u = 0;
         $user->d = 0;
-        $user->method = Config::get('reg_method');
-        $user->protocol = Config::get('reg_protocol');
-        $user->protocol_param = Config::get('reg_protocol_param');
-        $user->obfs = Config::get('reg_obfs');
-        $user->obfs_param = Config::get('reg_obfs_param');
-        $user->forbidden_ip = Config::get('reg_forbidden_ip');
-        $user->forbidden_port = Config::get('reg_forbidden_port');
+        $user->method = $configs['reg_method'];
         $user->im_type = $imtype;
-        $user->im_value = $antiXss->xss_clean($wechat);
-        $user->transfer_enable = Tools::toGB(Config::get('defaultTraffic'));
-        $user->invite_num = Config::get('inviteNum');
-        $user->auto_reset_day = Config::get('reg_auto_reset_day');
-        $user->auto_reset_bandwidth = Config::get('reg_auto_reset_bandwidth');
-        $user->money = 0;
+        $user->im_value = $imvalue;
+        $user->transfer_enable = Tools::gbToB($configs['reg_traffic']);
+        $user->auto_reset_day = Config::obtain('free_user_reset_day');
+        $user->auto_reset_bandwidth = Config::obtain('free_user_reset_bandwidth');
+        $user->daily_mail_enable = $configs['reg_daily_report'];
 
-        //dumplin：填写邀请人，写入邀请奖励
-        $user->ref_by = 0;
-        if (($c != null) && $c->user_id != 0) {
-            $gift_user = User::where('id', '=', $c->user_id)->first();
-            $user->ref_by = $c->user_id;
-            $user->money = Config::get('invite_get_money');
-            $gift_user->transfer_enable += Config::get('invite_gift') * 1024 * 1024 * 1024;
-            --$gift_user->invite_num;
-            $gift_user->save();
+        if ($money > 0) {
+            $user->money = $money;
+        } else {
+            $user->money = 0;
         }
 
+        $user->ref_by = 0;
 
-        $user->class_expire = date('Y-m-d H:i:s', time() + Config::get('user_class_expire_default') * 3600);
-        $user->class = Config::get('user_class_default');
-        $user->node_connector = Config::get('user_conn');
-        $user->node_speedlimit = Config::get('user_speedlimit');
-        $user->expire_in = date('Y-m-d H:i:s', time() + Config::get('user_expire_in_default') * 86400);
+        if ($invite_code !== '') {
+            $invite = (new InviteCode())->where('code', $invite_code)->first();
+
+            if ($invite !== null) {
+                $user->ref_by = $invite->user_id;
+            }
+        }
+
+        $user->class = $configs['reg_class'];
+        $user->class_expire = date('Y-m-d H:i:s', time() + (int) $configs['reg_class_time'] * 86400);
+        $user->node_iplimit = $configs['reg_ip_limit'];
+        $user->node_speedlimit = $configs['reg_speed_limit'];
         $user->reg_date = date('Y-m-d H:i:s');
         $user->reg_ip = $_SERVER['REMOTE_ADDR'];
-        $user->plan = 'A';
-        $user->theme = Config::get('theme');
+        $user->theme = $_ENV['theme'];
+        $user->locale = $_ENV['locale'];
+        $random_group = Config::obtain('random_group');
 
-        $groups = explode(',', Config::get('ramdom_group'));
-
-        $user->node_group = $groups[array_rand($groups)];
-
-        $ga = new GA();
-        $secret = $ga->createSecret();
-
-        $user->ga_token = $secret;
-        $user->ga_enable = 0;
-
-
-        if ($user->save()) {
-            $res['ret'] = 1;
-            $res['msg'] = '注册成功！正在进入登录界面';
-            Radius::Add($user, $user->passwd);
-            return $response->getBody()->write(json_encode($res));
+        if ($random_group === '') {
+            $user->node_group = 0;
+        } else {
+            $user->node_group = $random_group[array_rand(explode(',', $random_group))];
         }
 
-        $res['ret'] = 0;
-        $res['msg'] = '未知错误';
-        return $response->getBody()->write(json_encode($res));
+        $user->last_login_time = time();
+
+        if ($user->save() && ! $is_admin_reg) {
+            if ($user->ref_by !== 0) {
+                Reward::issueRegReward($user->id, $user->ref_by);
+            }
+
+            Auth::login($user->id, 3600);
+            (new LoginIp())->collectLoginIP($_SERVER['REMOTE_ADDR'], 0, $user->id);
+
+            return $response->withHeader('HX-Redirect', $redir);
+        }
+
+        return ResponseHelper::error($response, '未知错误');
     }
 
-    public function logout($request, $response, $next)
+    /**
+     * @throws RedisException
+     * @throws Exception
+     */
+    public function registerHandle(ServerRequest $request, Response $response, array $args): ResponseInterface
+    {
+        if (Config::obtain('reg_mode') === 'close') {
+            return ResponseHelper::error($response, '未开放注册。');
+        }
+
+        if (Config::obtain('enable_reg_captcha') && ! Captcha::verify($request->getParams())) {
+            return ResponseHelper::error($response, '系统无法接受你的验证结果，请刷新页面后重试。');
+        }
+
+        $tos = $request->getParam('tos') === 'true' ? 1 : 0;
+        $email = strtolower(trim($this->antiXss->xss_clean($request->getParam('email'))));
+        $name = $this->antiXss->xss_clean($request->getParam('name'));
+        $password = $request->getParam('password');
+        $confirm_password = $request->getParam('confirm_password');
+        $invite_code = $this->antiXss->xss_clean(trim($request->getParam('invite_code')));
+
+        if (! $tos) {
+            return ResponseHelper::error($response, '请同意服务条款');
+        }
+
+        if (strlen($password) < 8) {
+            return ResponseHelper::error($response, '密码请大于8位');
+        }
+
+        if ($password !== $confirm_password) {
+            return ResponseHelper::error($response, '两次密码输入不符');
+        }
+
+        if ($invite_code === '' && Config::obtain('reg_mode') === 'invite') {
+            return ResponseHelper::error($response, '邀请码不能为空');
+        }
+
+        if ($invite_code !== '') {
+            $invite = (new InviteCode())->where('code', $invite_code)->first();
+
+            if ($invite === null) {
+                return ResponseHelper::error($response, '邀请码无效');
+            }
+
+            $ref_user = (new User())->where('id', $invite->user_id)->first();
+
+            if ($ref_user === null) {
+                return ResponseHelper::error($response, '邀请码无效');
+            }
+        }
+
+        $imtype = 0;
+        $imvalue = '';
+
+        // check email format
+        $email_check = Filter::checkEmailFilter($email);
+
+        if (! $email_check) {
+            return ResponseHelper::error($response, '无效的邮箱');
+        }
+        // check email
+        $user = (new User())->where('email', $email)->first();
+
+        if ($user !== null) {
+            return ResponseHelper::error($response, '无效的邮箱');
+        }
+
+        if (Config::obtain('reg_email_verify')) {
+            $redis = (new Cache())->initRedis();
+            $email_verify_code = trim($this->antiXss->xss_clean($request->getParam('emailcode')));
+            $email_verify = $redis->get('email_verify:' . $email_verify_code);
+
+            if (! $email_verify) {
+                return ResponseHelper::error($response, '你的邮箱验证码不正确');
+            }
+
+            $redis->del('email_verify:' . $email_verify_code);
+        }
+
+        return $this->registerHelper($response, $name, $email, $password, $invite_code, $imtype, $imvalue, 0, 0);
+    }
+
+    public function logout(ServerRequest $request, Response $response, $next): Response
     {
         Auth::logout();
+
         return $response->withStatus(302)->withHeader('Location', '/auth/login');
     }
 
-    public function qrcode_check($request, $response, $args)
+    public function webauthnRequest(ServerRequest $request, Response $response, $next): ResponseInterface
     {
-        $token = $request->getParam('token');
-        $number = $request->getParam('number');
-        $user = Auth::getUser();
-        if ($user->isLogin) {
-            $res['ret'] = 0;
-            return $response->getBody()->write(json_encode($res));
-        }
-
-        if (Config::get('enable_telegram') === true) {
-            $ret = TelegramSessionManager::check_login_session($token, $number);
-            $res['ret'] = $ret;
-            return $response->getBody()->write(json_encode($res));
-        }
-
-        $res['ret'] = 0;
-        return $response->getBody()->write(json_encode($res));
+        return $response->withJson(WebAuthn::assertRequest());
     }
 
-    public function telegram_oauth($request, $response, $args)
+    public function webauthnHandle(ServerRequest $request, Response $response, $next): ResponseInterface
     {
-        if (Config::get('enable_telegram') === true) {
-            $auth_data = $request->getQueryParams();
-            if ($this->telegram_oauth_check($auth_data) === true) { // Looks good, proceed.
-                $telegram_id = $auth_data['id'];
-                $user = User::query()->where('telegram_id', $telegram_id)->firstOrFail(); // Welcome Back :)
-                if ($user == null) {
-                    return $this->view()->assign('title', '您需要先进行邮箱注册后绑定Telegram才能使用授权登录')->assign('message', '很抱歉带来的不便，请重新试试')->assign('redirect', '/auth/login')->display('telegram_error.tpl');
-                }
-                Auth::login($user->id, 3600);
-                $this->logUserIp($user->id, $_SERVER['REMOTE_ADDR']);
-
-                // 登陆成功！
-                return $this->view()->assign('title', '登录成功')->assign('message', '正在前往仪表盘')->assign('redirect', '/user')->display('telegram_success.tpl');
+        $data = $this->antiXss->xss_clean((array) $request->getParsedBody());
+        $redir = $this->antiXss->xss_clean(Cookie::get('redir')) ?? '/user';
+        $result = WebAuthn::assertHandle($data);
+        if ($result['ret'] === 1) {
+            $user = $result['user'];
+            if ($user === null) {
+                return $response->withJson([
+                    'ret' => 0,
+                    'msg' => '用户不存在',
+                ]);
             }
-            // 验证失败
-            return $this->view()->assign('title', '登陆超时或非法构造信息')->assign('message', '很抱歉带来的不便，请重新试试')->assign('redirect', '/auth/login')->display('telegram_error.tpl');
+            $rememberMe = $request->getParam('remember_me') === 'true';
+            $time = $rememberMe ? 86400 * ($_ENV['rememberMeDuration'] ?? 7) : 3600;
+            Auth::login($user->id, $time);
+            $loginIp = new LoginIp();
+            $loginIp->collectLoginIP($_SERVER['REMOTE_ADDR'], 0, $user->id);
+            $user->last_login_time = time();
+            $user->save();
+            return $response->withJson([
+                'ret' => 1,
+                'msg' => '登录成功',
+                'redir' => $redir,
+            ]);
         }
-        return $response->withRedirect('/404');
+        return $response->withJson($result);
     }
 
-    private function telegram_oauth_check($auth_data)
+    public function totpHandle(ServerRequest $request, Response $response, $next): ResponseInterface
     {
-        $check_hash = $auth_data['hash'];
-        $bot_token = Config::get('telegram_token');
-        unset($auth_data['hash']);
-        $data_check_arr = [];
-        foreach ($auth_data as $key => $value) {
-            $data_check_arr[] = $key . '=' . $value;
+        $redis = (new Cache())->initRedis();
+        $login_session = $redis->get('mfa_login_' . session_id());
+        if ($login_session === false) {
+            return $response->withJson(['ret' => 0, 'msg' => '登录会话已过期'])->withHeader('HX-Redirect', '/auth/login');
         }
-        sort($data_check_arr);
-        $data_check_string = implode("\n", $data_check_arr);
-        $secret_key = hash('sha256', $bot_token, true);
-        $hash = hash_hmac('sha256', $data_check_string, $secret_key);
-        if (strcmp($hash, $check_hash) !== 0) {
-            return false; // Bad Data :(
+        $login_session = json_decode($login_session, true);
+        $code = $this->antiXss->xss_clean($request->getParam('code'));
+        $user = (new User())->where('id', $login_session['userid'])->first();
+        if ($user === null) {
+            return $response->withJson(['ret' => 0, 'msg' => '用户不存在'])->withHeader('HX-Redirect', '/auth/login');
         }
+        $result = TOTP::assertHandle($user, $code);
+        if ($result['ret'] === 1) {
+            $redis->del('mfa_login_' . session_id());
+            $rememberMe = $login_session['remember_me'];
+            $time = $rememberMe ? 86400 * ($_ENV['rememberMeDuration'] ?? 7) : 3600;
+            Auth::login($user->id, $time);
+            $loginIp = new LoginIp();
+            $loginIp->collectLoginIP($_SERVER['REMOTE_ADDR'], 0, $user->id);
+            $user->last_login_time = time();
+            $user->save();
+            return $response
+                ->withHeader('HX-Redirect', $login_session['redir'])
+                ->withJson(['ret' => 1, 'msg' => '登录成功']);
+        }
+        return $response->withJson($result);
+    }
 
-        if ((time() - $auth_data['auth_date']) > 300) { // Expire @ 5mins
-            return false;
+    public function fidoRequest(ServerRequest $request, Response $response, $next): ResponseInterface
+    {
+        $redis = (new Cache())->initRedis();
+        $login_session = $redis->get('mfa_login_' . session_id());
+        if ($login_session === false) {
+            return $response->withJson(['ret' => 0, 'msg' => '登录会话已过期'])->withHeader('HX-Redirect', '/auth/login');
         }
+        $login_session = json_decode($login_session, true);
+        $user = (new User())->where('id', $login_session['userid'])->first();
+        if ($user === null) {
+            return $response->withJson(['ret' => 0, 'msg' => '用户不存在'])->withHeader('HX-Redirect', '/auth/login');
+        }
+        return $response->withJson(FIDO::assertRequest($user));
+    }
 
-        return true; // Good to Go
+    public function fidoHandle(ServerRequest $request, Response $response, $next): ResponseInterface
+    {
+        $redis = (new Cache())->initRedis();
+        $login_session = $redis->get('mfa_login_' . session_id());
+        if ($login_session === false) {
+            return $response->withJson(['ret' => 0, 'msg' => '登录会话已过期'])->withHeader('HX-Redirect', '/auth/login');
+        }
+        $login_session = json_decode($login_session, true);
+        $data = $this->antiXss->xss_clean((array) $request->getParsedBody());
+        $user = (new User())->where('id', $login_session['userid'])->first();
+        if ($user === null) {
+            return $response->withJson(['ret' => 0, 'msg' => '用户不存在'])->withHeader('HX-Redirect', '/auth/login');
+        }
+        $result = FIDO::assertHandle($user, $data);
+        if ($result['ret'] === 1) {
+            $redis->del('mfa_login_' . session_id());
+            $rememberMe = $login_session['remember_me'];
+            $time = $rememberMe ? 86400 * ($_ENV['rememberMeDuration'] ?? 7) : 3600;
+            Auth::login($user->id, $time);
+            $loginIp = new LoginIp();
+            $loginIp->collectLoginIP($_SERVER['REMOTE_ADDR'], 0, $user->id);
+            $user->last_login_time = time();
+            $user->save();
+            return $response->withJson(['ret' => 1, 'msg' => '登录成功', 'redir' => $login_session['redir']]);
+        }
+        return $response->withJson($result);
     }
 }

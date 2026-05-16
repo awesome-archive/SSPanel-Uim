@@ -1,28 +1,32 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Services;
 
-use Illuminate\Database\Capsule\Manager as Capsule;
+use function date_default_timezone_set;
+use function microtime;
+use function Sentry\init;
 
-class Boot
+final class Boot
 {
-    public static function setTime()
+    public static function setTime(): void
     {
-        date_default_timezone_set(Config::get('timeZone'));
+        date_default_timezone_set($_ENV['timeZone']);
         View::$beginTime = microtime(true);
     }
 
-    public static function bootDb()
+    public static function bootDb(): void
     {
-        // Init Eloquent ORM Connection
-        $capsule = new Capsule();
-        $capsule->addConnection(Config::getDbConfig());
-        if (Config::get('enable_radius') == true) {
-            $capsule->addConnection(Config::getRadiusDbConfig(), 'radius');
-        }
-        $capsule->bootEloquent();
+        DB::init();
+    }
 
-        View::$connection = $capsule->getDatabaseManager();
-        $capsule->getDatabaseManager()->connection('default')->enableQueryLog();
+    public static function bootSentry(): void
+    {
+        if ($_ENV['sentry_dsn'] !== '') {
+            init([
+                'dsn' => $_ENV['sentry_dsn'],
+            ]);
+        }
     }
 }
